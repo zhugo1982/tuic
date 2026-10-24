@@ -8,7 +8,7 @@
 # 系统要求: Debian / Ubuntu, systemd, 公网 IP, 安全组/防火墙放行 443/udp（有域名时另需 80/tcp）
 set -euo pipefail
 
-PORT="${PORT:-443}"
+PORT="${PORT:-2053}"
 DOMAIN="${DOMAIN:-}"
 
 echo "==> 安装依赖"
