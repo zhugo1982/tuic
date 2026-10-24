@@ -1,3 +1,4 @@
+单协议，可同12协议，部署同一台VPS
 ```
 curl -sSL https://raw.githubusercontent.com/zhugo1982/tuic/refs/heads/main/t -o /usr/local/bin/tuic && chmod +x /usr/local/bin/tuic; tuic
 ```
