@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# TUIC v5 一键安装（基于 sing-box）— 在你自己的 VPS 上以 root 运行
+# 用法:
+#   无域名（自签证书，客户端需开启“跳过证书验证”）:
+#     bash install-tuic.sh
+#   有域名（先把域名 A 记录解析到本机 IP，再运行）:
+#     DOMAIN=tuic.example.com bash install-tuic.sh
+# 系统要求: Debian / Ubuntu, systemd, 公网 IP, 安全组/防火墙放行 443/udp（有域名时另需 80/tcp）
+set -euo pipefail
+
+PORT="${PORT:-443}"
+DOMAIN="${DOMAIN:-}"
+
+echo "==> 安装依赖"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y curl openssl uuid-runtime ufw || true
+
+echo "==> 安装 sing-box（官方源）"
+if ! command -v sing-box >/dev/null 2>&1; then
+  bash <(curl -fsSL https://sing-box.app/deb-install.sh)
+fi
+sing-box version
+
+echo "==> 生成账号"
+UUID="$(sing-box generate uuid)"
+PASSWORD="$(openssl rand -base64 24 | tr -d '\n')"
+mkdir -p /etc/sing-box/certs
+
+if [ -n "$DOMAIN" ]; then
+  echo "==> 用 Let's Encrypt 申请证书: $DOMAIN（需 80/tcp 可达）"
+  apt-get install -y certbot
+  certbot certonly --standalone -d "$DOMAIN" --agree-tos --register-unsafely-without-email --non-interactive
+  CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+  KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+  SNI="$DOMAIN"
+  INSECURE="0"
+else
+  echo "==> 生成自签证书（10 年）"
+  SERVER_IP="$(curl -s -4 https://api.ipify.org || hostname -I | awk '{print $1}')"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout /etc/sing-box/certs/key.pem -out /etc/sing-box/certs/cert.pem \
+    -days 3650 -nodes -subj "/CN=$SERVER_IP" \
+    -addext "subjectAltName=IP:$SERVER_IP"
+  CERT="/etc/sing-box/certs/cert.pem"
+  KEY="/etc/sing-box/certs/key.pem"
+  SNI="$SERVER_IP"
+  INSECURE="1"
+fi
+
+echo "==> 写服务端配置 /etc/sing-box/config.json"
+cat > /etc/sing-box/config.json <<EOF
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": $PORT,
+      "users": [{ "name": "hugo", "uuid": "$UUID", "password": "$PASSWORD" }],
+      "congestion_control": "bbr",
+      "auth_timeout": "3s",
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "$CERT",
+        "key_path": "$KEY"
+      }
+    }
+  ],
+  "outbounds": [{ "type": "direct" }]
+}
+EOF
+
+echo "==> 开启 BBR + 放行防火墙"
+sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+ufw allow "${PORT}/udp" >/dev/null 2>&1 || true
+[ -n "$DOMAIN" ] && ufw allow 80/tcp >/dev/null 2>&1 || true
+
+sing-box check -c /etc/sing-box/config.json
+systemctl enable --now sing-box
+systemctl restart sing-box
+sleep 1
+systemctl --no-pager -l status sing-box | head -20 || true
+
+SERVER_IP="${SERVER_IP:-$(curl -s -4 https://api.ipify.org || true)}"
+HOST_FOR_LINK="${DOMAIN:-$SERVER_IP}"
+
+cat <<EOF
+
+================ 完成，把下面这行导入客户端 ================
+支持 TUIC 的客户端: v2rayN / Nekoray / Sing-box / Shadowrocket / FlClash
+
+tuic://${UUID}:${PASSWORD}@${HOST_FOR_LINK}:${PORT}?congestion_control=bbr&alpn=h3&sni=${SNI}&allow_insecure=${INSECURE}#TUIC-hugo
+
+服务器: ${HOST_FOR_LINK}   端口: ${PORT}/udp
+UUID: ${UUID}
+密码: ${PASSWORD}
+SNI: ${SNI}   跳过证书验证(allow_insecure): ${INSECURE}
+==============================================================
+提醒: 云厂商安全组也要放行 ${PORT}/udp，不然连不上。
+查看日志: journalctl -u sing-box -f
+EOF
